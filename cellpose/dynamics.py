@@ -631,28 +631,28 @@ def remove_bad_flow_masks(masks, flows, threshold=0.4, device=None):
             0=NO masks; 1,2,...=mask labels, size [Ly x Lx] or [Lz x Ly x Lx].
     """
     device0 = device
-    if masks.size > 10000 * 10000 and (device is not None and device.type == "cuda"):
+    # if masks.size > 10000 * 10000 and (device is not None and device.type == "cuda"):
 
-        major_version, minor_version, _ = torch.__version__.split(".")
+    #     major_version, minor_version, _ = torch.__version__.split(".")
 
-        if major_version == "1" and int(minor_version) < 10:
-            # for PyTorch version lower than 1.10
-            def mem_info():
-                total_mem = torch.cuda.get_device_properties(0).total_memory
-                used_mem = torch.cuda.memory_allocated()
-                return total_mem, used_mem
-        else:
-            # for PyTorch version 1.10 and above
-            def mem_info():
-                total_mem, used_mem = torch.cuda.mem_get_info()
-                return total_mem, used_mem
+    #     if major_version == "1" and int(minor_version) < 10:
+    #         # for PyTorch version lower than 1.10
+    #         def mem_info():
+    #             total_mem = torch.cuda.get_device_properties(0).total_memory
+    #             used_mem = torch.cuda.memory_allocated()
+    #             return total_mem, used_mem
+    #     else:
+    #         # for PyTorch version 1.10 and above
+    #         def mem_info():
+    #             total_mem, used_mem = torch.cuda.mem_get_info()
+    #             return total_mem, used_mem
 
-        if masks.size * 20 > mem_info()[0]:
-            dynamics_logger.warning(
-                "WARNING: image is very large, not using gpu to compute flows from masks for QC step flow_threshold"
-            )
-            dynamics_logger.info("turn off QC step with flow_threshold=0 if too slow")
-            device0 = None
+    #     if masks.size * 20 > mem_info()[0]:
+    #         dynamics_logger.warning(
+    #             "WARNING: image is very large, not using gpu to compute flows from masks for QC step flow_threshold"
+    #         )
+    #         dynamics_logger.info("turn off QC step with flow_threshold=0 if too slow")
+    #         device0 = None
 
     merrors, _ = metrics.flow_error(masks, flows, device0)
     badi = 1 + (merrors > threshold).nonzero()[0]
@@ -834,9 +834,10 @@ def compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
         if not do_3D:
             if mask.max() > 0 and flow_threshold is not None and flow_threshold > 0:
                 # make sure labels are unique at output of get_masks
+                # mask = remove_bad_flow_masks(mask, dP, threshold=flow_threshold,
+                #                              device=device)
                 mask = remove_bad_flow_masks(mask, dP, threshold=flow_threshold,
-                                             device=device)
-
+                                             device= None)
         if mask.max() > 2**16 - 1:
             recast = True
             mask = mask.astype(np.float32)
