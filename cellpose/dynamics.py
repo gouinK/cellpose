@@ -834,10 +834,14 @@ def compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
         if not do_3D:
             if mask.max() > 0 and flow_threshold is not None and flow_threshold > 0:
                 # make sure labels are unique at output of get_masks
-                # mask = remove_bad_flow_masks(mask, dP, threshold=flow_threshold,
-                #                              device=device)
-                mask = remove_bad_flow_masks(mask, dP, threshold=flow_threshold,
-                                             device= None)
+                try:
+                    dynamics_logger.warning("Attempting remove_bad_flow_masks with default device.")
+                    mask = remove_bad_flow_masks(mask, dP, threshold=flow_threshold,
+                                                device=device)
+                except:
+                    dynamics_logger.warning("Resorting to CPU for remove_bad_flow_masks.")
+                    mask = remove_bad_flow_masks(mask, dP, threshold=flow_threshold,
+                                                device= None)
         if mask.max() > 2**16 - 1:
             recast = True
             mask = mask.astype(np.float32)
