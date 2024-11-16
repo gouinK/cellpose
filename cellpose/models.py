@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 import torch
 
 import logging
+from datetime import timedelta
 
 models_logger = logging.getLogger(__name__)
 
@@ -342,7 +343,7 @@ class CellposeModel():
              flow_threshold=0.4, cellprob_threshold=0.0, do_3D=False, anisotropy=None,
              stitch_threshold=0.0, min_size=15, niter=None, augment=False, tile=True,
              tile_overlap=0.1, bsize=224, interp=True, compute_masks=True,
-             progress=None):
+             progress=None, logger=None):
         """ segment list of images x, or 4D array - Z x nchan x Y x X
 
         Args:
@@ -405,6 +406,7 @@ class CellposeModel():
             iterator = trange(nimg, file=tqdm_out,
                               mininterval=30) if nimg > 1 else range(nimg)
             for i in iterator:
+                print(f'Segmenting image {i+1}/{nimg}')
                 tic = time.time()
                 maski, flowi, stylei = self.eval(
                     x[i], batch_size=batch_size,
@@ -423,7 +425,7 @@ class CellposeModel():
                     interp=interp, flow_threshold=flow_threshold,
                     cellprob_threshold=cellprob_threshold, compute_masks=compute_masks,
                     min_size=min_size, stitch_threshold=stitch_threshold,
-                    progress=progress, niter=niter)
+                    progress=progress, niter=niter, logger=logger)
                 masks.append(maski)
                 flows.append(flowi)
                 styles.append(stylei)
@@ -432,10 +434,15 @@ class CellposeModel():
 
         else:
             # reshape image
+            t1 = time.monotonic()
             x = transforms.convert_image(x, channels, channel_axis=channel_axis,
                                          z_axis=z_axis, do_3D=(do_3D or
                                                                stitch_threshold > 0),
                                          nchan=self.nchan)
+            t2 = time.monotonic()
+            dt = t2 - t1
+            if logger is not None: logger.info(f'transforms.convert_image: {timedelta(seconds=dt)}')
+
             if x.ndim < 4:
                 x = x[np.newaxis, ...]
             self.batch_size = batch_size
@@ -446,21 +453,28 @@ class CellposeModel():
                 diameter = self.diam_labels
                 rescale = self.diam_mean / diameter
 
+            if logger is not None: logger.info('Call _run_cp')
             masks, styles, dP, cellprob, p = self._run_cp(
                 x, compute_masks=compute_masks, normalize=normalize, invert=invert,
                 rescale=rescale, resample=resample, augment=augment, tile=tile,
                 tile_overlap=tile_overlap, bsize=bsize, flow_threshold=flow_threshold,
                 cellprob_threshold=cellprob_threshold, interp=interp, min_size=min_size,
                 do_3D=do_3D, anisotropy=anisotropy, niter=niter,
-                stitch_threshold=stitch_threshold)
+                stitch_threshold=stitch_threshold,
+                logger=logger)
 
+            if logger is not None: logger.info('flow plots')
+            t1 = time.monotonic()
             flows = [plot.dx_to_circ(dP), dP, cellprob, p]
+            t2 = time.monotonic()
+            dt = t2 - t1
+            if logger is not None: logger.info(f'flow plots: {timedelta(seconds=dt)}')
             return masks, flows, styles
 
     def _run_cp(self, x, compute_masks=True, normalize=True, invert=False, niter=None,
                 rescale=1.0, resample=True, augment=False, tile=True, tile_overlap=0.1,
                 cellprob_threshold=0.0, bsize=224, flow_threshold=0.4, min_size=15,
-                interp=True, anisotropy=1.0, do_3D=False, stitch_threshold=0.0):
+                interp=True, anisotropy=1.0, do_3D=False, stitch_threshold=0.0, logger=None):
 
         if isinstance(normalize, dict):
             normalize_params = {**normalize_default, **normalize}
@@ -474,6 +488,7 @@ class CellposeModel():
         tic = time.time()
         shape = x.shape
         nimg = shape[0]
+        if logger is not None: logger.info(f'_run_cp: {nimg=}')
 
         bd, tr = None, None
 
@@ -514,13 +529,32 @@ class CellposeModel():
             for i in iterator:
                 img = np.asarray(x[i])
                 if do_normalization:
+                    t1 = time.monotonic()
                     img = transforms.normalize_img(img, **normalize_params)
+                    t2 = time.monotonic()
+                    dt = t2 - t1
+                    if logger is not None: logger.info(f'_run_cp: transforms.normalize_img: {timedelta(seconds=dt)}')
                 if rescale != 1.0:
+                    t1 = time.monotonic()
                     img = transforms.resize_image(img, rsz=rescale)
+                    t2 = time.monotonic()
+                    dt = t2 - t1
+                    if logger is not None: logger.info(f'_run_cp: transforms.resize_image: {timedelta(seconds=dt)}')
+
+                if logger is not None: logger.info('Starting run_net')
+                t1 = time.monotonic()
                 yf, style = run_net(self.net, img, bsize=bsize, augment=augment,
                                     tile=tile, tile_overlap=tile_overlap)
+                t2 = time.monotonic()
+                dt = t2 - t1
+                if logger is not None: logger.info(f'_run_cp: transforms.run_net: {timedelta(seconds=dt)}')
+
                 if resample:
+                    t1 = time.monotonic()
                     yf = transforms.resize_image(yf, shape[1], shape[2])
+                    t2 = time.monotonic()
+                    dt = t2 - t1
+                    if logger is not None: logger.info(f'_run_cp: transforms.resize_image: {timedelta(seconds=dt)}')
 
                 cellprob[i] = yf[:, :, 2]
                 dP[:, i] = yf[:, :, :2].transpose((2, 0, 1))
@@ -533,10 +567,12 @@ class CellposeModel():
         styles = styles.squeeze()
 
         net_time = time.time() - tic
+        if logger is not None: logger.info(f'Net done in {timedelta(seconds=net_time)}')
         if nimg > 1:
             models_logger.info("network run in %2.2fs" % (net_time))
 
         if compute_masks:
+            if logger is not None: logger.info(f'Starting to compute masks {do_3D=}')
             tic = time.time()
             niter0 = 200 if (do_3D and not resample) else (1 / rescale * 200)
             niter = niter0 if niter is None or niter == 0 else niter
@@ -553,6 +589,7 @@ class CellposeModel():
                 iterator = trange(nimg, file=tqdm_out,
                                   mininterval=30) if nimg > 1 else range(nimg)
                 for i in iterator:
+                    t1 = time.monotonic()
                     outputs = dynamics.resize_and_compute_masks(
                         dP[:, i],
                         cellprob[i],
@@ -566,6 +603,10 @@ class CellposeModel():
                         device=self.device if self.gpu else None)
                     masks.append(outputs[0])
                     p.append(outputs[1])
+
+                    t2 = time.monotonic()
+                    dt = t2 - t1
+                    if logger is not None: logger.info(f'_run_cp: dynamics.resize_and_compute_masks: {timedelta(seconds=dt)}')
 
                 masks = np.array(masks)
                 p = np.array(p)

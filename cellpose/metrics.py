@@ -7,6 +7,9 @@ from numba import jit
 from scipy.optimize import linear_sum_assignment
 from scipy.ndimage import convolve, mean
 
+import time
+from datetime import timedelta
+
 
 def mask_ious(masks_true, masks_pred):
     """Return best-matched masks."""
@@ -229,7 +232,7 @@ def _true_positive(iou, th):
     return tp
 
 
-def flow_error(maski, dP_net, device=None):
+def flow_error(maski, dP_net, device=None, logger=None):
     """Error in flows from predicted masks vs flows predicted by network run on image.
 
     This function serves to benchmark the quality of masks. It works as follows:
@@ -249,16 +252,29 @@ def flow_error(maski, dP_net, device=None):
         dP_masks (np.ndarray, float): ND flows produced from the predicted masks.
     """
     if dP_net.shape[1:] != maski.shape:
-        print("ERROR: net flow is not same size as predicted masks")
+        if logger is not None: logger.error("ERROR: net flow is not same size as predicted masks")
         return
 
     # flows predicted from estimated masks
+
+    if logger is not None: logger.info(f'flow_error: dynamics.masks_to_flows')
+    t1 = time.monotonic()
     dP_masks = dynamics.masks_to_flows(maski, device=device)
+    t2 = time.monotonic()
+    dt = t2 - t1
+    if logger is not None: logger.info(f'flow_error: dynamics.masks_to_flows: {timedelta(seconds=dt)}')
+
     # difference between predicted flows vs mask flows
+    if logger is not None: logger.info(f'flow_error iterations: {maski.shape=} {dP_masks.shape[0]=}')
     flow_errors = np.zeros(maski.max())
     for i in range(dP_masks.shape[0]):
+        t1 = time.monotonic()
         flow_errors += mean((dP_masks[i] - dP_net[i] / 5.)**2, maski,
                             index=np.arange(1,
                                             maski.max() + 1))
+
+        t2 = time.monotonic()
+        dt = t2 - t1
+        if logger is not None: logger.info(f'flow_error: iteration {i}: {timedelta(seconds=dt)}')
 
     return flow_errors, dP_masks

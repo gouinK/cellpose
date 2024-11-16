@@ -13,6 +13,7 @@ import cv2
 import fastremap
 
 import logging
+from datetime import timedelta
 
 dynamics_logger = logging.getLogger(__name__)
 
@@ -612,7 +613,7 @@ def follow_flows(dP, mask=None, niter=200, interp=True, device=None):
     return p, inds
 
 
-def remove_bad_flow_masks(masks, flows, threshold=0.4, device=None):
+def remove_bad_flow_masks(masks, flows, threshold=0.4, device=None, logger=None):
     """Remove masks which have inconsistent flows.
 
     Uses metrics.flow_error to compute flows from predicted masks 
@@ -654,9 +655,16 @@ def remove_bad_flow_masks(masks, flows, threshold=0.4, device=None):
     #         dynamics_logger.info("turn off QC step with flow_threshold=0 if too slow")
     #         device0 = None
 
-    merrors, _ = metrics.flow_error(masks, flows, device0)
+    if logger is not None: logger.info(f'remove_bad_flow_masks: {device0=}')
+    t1 = time.monotonic()
+    merrors, _ = metrics.flow_error(masks, flows, device0, logger=logger)
     badi = 1 + (merrors > threshold).nonzero()[0]
     masks[np.isin(masks, badi)] = 0
+
+    t2 = time.monotonic()
+    dt = t2 - t1
+    if logger is not None: logger.info(f'remove_bad_flow_masks: flow_error: {timedelta(seconds=dt)}')
+
     return masks
 
 
@@ -758,7 +766,7 @@ def get_masks(p, iscell=None, rpad=20):
 
 def resize_and_compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
                              flow_threshold=0.4, interp=True, do_3D=False, min_size=15,
-                             resize=None, device=None):
+                             resize=None, device=None, logger=None):
     """Compute masks using dynamics from dP and cellprob, and resizes masks if resize is not None.
 
     Args:
@@ -780,7 +788,7 @@ def resize_and_compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold
     mask, p = compute_masks(dP, cellprob, p=p, niter=niter,
                             cellprob_threshold=cellprob_threshold,
                             flow_threshold=flow_threshold, interp=interp, do_3D=do_3D,
-                            min_size=min_size, device=device)
+                            min_size=min_size, device=device, logger=logger)
 
     if resize is not None:
         mask = transforms.resize_image(mask, resize[0], resize[1],
@@ -795,7 +803,7 @@ def resize_and_compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold
 
 def compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
                   flow_threshold=0.4, interp=True, do_3D=False, min_size=15,
-                  device=None):
+                  device=None, logger=None):
     """Compute masks using dynamics from dP and cellprob.
 
     Args:
@@ -813,13 +821,21 @@ def compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
     Returns:
         tuple: A tuple containing the computed masks and the final pixel locations.
     """
+    if logger is not None: logger.info('compute_masks.')
     cp_mask = cellprob > cellprob_threshold
 
     if np.any(cp_mask):  #mask at this point is a cell cluster binary map, not labels
         # follow flows
         if p is None:
+            if logger is not None: logger.info('follow_flows')
+            t1 = time.monotonic()
             p, inds = follow_flows(dP * cp_mask / 5., niter=niter, interp=interp,
                                    device=device)
+
+            t2 = time.monotonic()
+            dt = t2 - t1
+            if logger is not None: logger.info(f'compute_masks: follow_flows: {timedelta(seconds=dt)}')
+
             if inds is None:
                 dynamics_logger.info("No cell pixels found.")
                 shape = cellprob.shape
@@ -828,20 +844,26 @@ def compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
                 return mask, p
 
         #calculate masks
+        t1 = time.monotonic()
         mask = get_masks(p, iscell=cp_mask)
+        t2 = time.monotonic()
+        dt = t2 - t1
+        if logger is not None: logger.info(f'compute_masks: get_masks: {timedelta(seconds=dt)}')
 
         # flow thresholding factored out of get_masks
         if not do_3D:
             if mask.max() > 0 and flow_threshold is not None and flow_threshold > 0:
                 # make sure labels are unique at output of get_masks
                 try:
-                    dynamics_logger.warning("Attempting remove_bad_flow_masks with default device.")
+                    if logger is not None: logger.info("Attempting remove_bad_flow_masks with default device.")
+                    # print("Attempting remove_bad_flow_masks with default device.")
                     mask = remove_bad_flow_masks(mask, dP, threshold=flow_threshold,
-                                                device=device)
+                                                device=device, logger=logger)
                 except:
-                    dynamics_logger.warning("Resorting to CPU for remove_bad_flow_masks.")
+                    if logger is not None: logger.info("Resorting to CPU for remove_bad_flow_masks.")
+                    # print("Resorting to CPU for remove_bad_flow_masks.")
                     mask = remove_bad_flow_masks(mask, dP, threshold=flow_threshold,
-                                                device= None)
+                                                device= None, logger=logger)
         if mask.max() > 2**16 - 1:
             recast = True
             mask = mask.astype(np.float32)
@@ -865,7 +887,7 @@ def compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
     mask = utils.fill_holes_and_remove_small_masks(mask, min_size=min_size)
 
     if mask.dtype == np.uint32:
-        dynamics_logger.warning(
+        if logger is not None: logger.info(
             "more than 65535 masks in image, masks returned as np.uint32")
 
     return mask, p
