@@ -600,7 +600,8 @@ class CellposeModel():
                         resize=resize,
                         min_size=min_size if stitch_threshold == 0 or nimg == 1 else
                         -1,  # turn off for 3D stitching
-                        device=self.device if self.gpu else None)
+                        device=self.device if self.gpu else None,
+                        logger=logger)
                     masks.append(outputs[0])
                     p.append(outputs[1])
 
