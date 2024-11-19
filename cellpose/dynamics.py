@@ -668,7 +668,7 @@ def remove_bad_flow_masks(masks, flows, threshold=0.4, device=None, logger=None)
     return masks
 
 
-def get_masks(p, iscell=None, rpad=20):
+def get_masks(p, iscell=None, rpad=20, logger=None):
     """Create masks using pixel convergence after running dynamics.
 
     Makes a histogram of final pixel locations p, initializes masks 
@@ -691,6 +691,9 @@ def get_masks(p, iscell=None, rpad=20):
     edges = []
     shape0 = p.shape[1:]
     dims = len(p)
+    if logger is not None: logger.info(f'get_masks: meshgrid')
+
+    t1 = time.monotonic()
     if iscell is not None:
         if dims == 3:
             inds = np.meshgrid(np.arange(shape0[0]), np.arange(shape0[1]),
@@ -701,14 +704,30 @@ def get_masks(p, iscell=None, rpad=20):
         for i in range(dims):
             p[i, ~iscell] = inds[i][~iscell]
 
+    t2 = time.monotonic()
+    dt = t2 - t1
+    if logger is not None: logger.info(f'get_masks: meshgrid : {timedelta(seconds=dt)}')
+
     for i in range(dims):
         pflows.append(p[i].flatten().astype("int32"))
         edges.append(np.arange(-.5 - rpad, shape0[i] + .5 + rpad, 1))
 
+    if logger is not None: logger.info(f'get_masks: histogram1d')
+    t1 = time.monotonic()
     h, _ = np.histogramdd(tuple(pflows), bins=edges)
+    t2 = time.monotonic()
+    dt = t2 - t1
+    if logger is not None: logger.info(f'get_masks: histogram1d : {timedelta(seconds=dt)}')
+
+
     hmax = h.copy()
     for i in range(dims):
+        if logger is not None: logger.info(f'get_masks: maximum_filter1d')
+        t1 = time.monotonic()
         hmax = maximum_filter1d(hmax, 5, axis=i)
+        t2 = time.monotonic()
+        dt = t2 - t1
+        if logger is not None: logger.info(f'get_masks: maximum_filter1d : {timedelta(seconds=dt)}')
 
     seeds = np.nonzero(np.logical_and(h - hmax > -1e-6, h > 10))
     Nmax = h[seeds]
@@ -724,6 +743,9 @@ def get_masks(p, iscell=None, rpad=20):
     else:
         expand = np.nonzero(np.ones((3, 3)))
 
+    if logger is not None: logger.info(f'get_masks: big loop: pix: {len(pix)}')
+    if logger is not None: logger.info(f'get_masks: big loop')
+    t1 = time.monotonic()
     for iter in range(5):
         for k in range(len(pix)):
             if iter == 0:
@@ -745,6 +767,10 @@ def get_masks(p, iscell=None, rpad=20):
             if iter == 4:
                 pix[k] = tuple(pix[k])
 
+    t2 = time.monotonic()
+    dt = t2 - t1
+    if logger is not None: logger.info(f'get_masks: big loop : {timedelta(seconds=dt)}')
+
     M = np.zeros(h.shape, np.uint32)
     for k in range(len(pix)):
         M[pix[k]] = 1 + k
@@ -753,6 +779,8 @@ def get_masks(p, iscell=None, rpad=20):
         pflows[i] = pflows[i] + rpad
     M0 = M[tuple(pflows)]
 
+    if logger is not None: logger.info(f'get_masks: remap - remove big masks')
+    t1 = time.monotonic()
     # remove big masks
     uniq, counts = fastremap.unique(M0, return_counts=True)
     big = np.prod(shape0) * 0.4
@@ -761,6 +789,11 @@ def get_masks(p, iscell=None, rpad=20):
         M0 = fastremap.mask(M0, bigc)
     fastremap.renumber(M0, in_place=True)  #convenient to guarantee non-skipped labels
     M0 = np.reshape(M0, shape0)
+
+    t2 = time.monotonic()
+    dt = t2 - t1
+    if logger is not None: logger.info(f'get_masks: remap : {timedelta(seconds=dt)}')
+
     return M0
 
 
