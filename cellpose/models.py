@@ -343,7 +343,7 @@ class CellposeModel():
              flow_threshold=0.4, cellprob_threshold=0.0, do_3D=False, anisotropy=None,
              stitch_threshold=0.0, min_size=15, niter=None, augment=False, tile=True,
              tile_overlap=0.1, bsize=224, interp=True, compute_masks=True,
-             progress=None, logger=None):
+             progress=None, logger=None, calculate_flow_plots:bool=False):
         """ segment list of images x, or 4D array - Z x nchan x Y x X
 
         Args:
@@ -463,12 +463,16 @@ class CellposeModel():
                 stitch_threshold=stitch_threshold,
                 logger=logger)
 
-            if logger is not None: logger.info('flow plots')
-            t1 = time.monotonic()
-            flows = [plot.dx_to_circ(dP), dP, cellprob, p]
-            t2 = time.monotonic()
-            dt = t2 - t1
-            if logger is not None: logger.info(f'flow plots: {timedelta(seconds=dt)}')
+            if calculate_flow_plots:
+                if logger is not None: logger.info('flow plots')
+                t1 = time.monotonic()
+                flows = [plot.dx_to_circ(dP), dP, cellprob, p]
+                t2 = time.monotonic()
+                dt = t2 - t1
+                if logger is not None: logger.info(f'flow plots: {timedelta(seconds=dt)}')
+            else:
+                if logger is not None: logger.info(f'Not calculating flows plots')
+                flows = None
             return masks, flows, styles
 
     def _run_cp(self, x, compute_masks=True, normalize=True, invert=False, niter=None,
