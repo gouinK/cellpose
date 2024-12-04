@@ -576,30 +576,26 @@ def follow_flows(dP, mask=None, niter=200, interp=True, device=None):
     Args:
         dP (np.ndarray): Flows [axis x Ly x Lx] or [axis x Lz x Ly x Lx].
         mask (np.ndarray, optional): Pixel mask to seed masks. Useful when flows have low magnitudes.
-        niter (int, optional): Number of iterations of dynamics to run. Default is 200.
+        niter (numeric, optional): Number of iterations of dynamics to run. Default is 200. Will be rounded if float.
         interp (bool, optional): Interpolate during 2D dynamics (not available in 3D). Default is True.
-        use_gpu (bool, optional): Use GPU to run interpolated dynamics (faster than CPU). Default is False.
+        device (torch.device): should be either torch.device('cpu') or torch.device('cuda').
 
     Returns:
         tuple containing:
             - p (np.ndarray): Final locations of each pixel after dynamics; [axis x Ly x Lx] or [axis x Lz x Ly x Lx].
             - inds (np.ndarray): Indices of pixels used for dynamics; [axis x Ly x Lx] or [axis x Lz x Ly x Lx].
     """
+
     shape = np.array(dP.shape[1:]).astype(np.int32)
     niter = np.uint32(niter)
+
+    p = np.indices(shape, dtype=np.float32)  # bit faster than going through meshgrid, but mostly less memory-intensive
+    inds = np.array(np.nonzero(np.abs(dP).max(axis=0) > 1e-3)).astype(np.int32).T
+
     if len(shape) > 2:
-        p = np.meshgrid(np.arange(shape[0]), np.arange(shape[1]), np.arange(shape[2]),
-                        indexing="ij")
-        p = np.array(p).astype(np.float32)
         # run dynamics on subset of pixels
-        inds = np.array(np.nonzero(np.abs(dP).max(axis=0) > 1e-3)).astype(np.int32).T
         p = steps3D(p, dP, inds, niter)
     else:
-        p = np.meshgrid(np.arange(shape[0]), np.arange(shape[1]), indexing="ij")
-        p = np.array(p).astype(np.float32)
-
-        inds = np.array(np.nonzero(np.abs(dP).max(axis=0) > 1e-3)).astype(np.int32).T
-
         if inds.ndim < 2 or inds.shape[0] < 5:
             dynamics_logger.warning("WARNING: no mask pixels found")
             return p, None
@@ -607,9 +603,10 @@ def follow_flows(dP, mask=None, niter=200, interp=True, device=None):
         if not interp:
             p = steps2D(p, dP.astype(np.float32), inds, niter)
         else:
-            p_interp = steps2D_interp(p[:, inds[:, 0], inds[:, 1]], dP, niter,
-                                      device=device)
-            p[:, inds[:, 0], inds[:, 1]] = p_interp
+            p_interp = steps2D_interp(p[:, inds[:, 0], inds[:, 1]], dP, niter, device=device)
+            for i in range(len(p)):  # somewhat faster than fancy indexing across the 0th axis
+                p[i, inds[:, 0], inds[:, 1]] = p_interp[i]
+
     return p, inds
 
 
@@ -668,6 +665,107 @@ def remove_bad_flow_masks(masks, flows, threshold=0.4, device=None, logger=None)
     return masks
 
 
+def construct_meshgrid(p:np.ndarray, iscell:np.ndarray=None):
+    """
+    Create a meshgrid of the same shape as p, masked appropriately by iscell if given.
+    Functional equivalent to using np.meshgrid, but faster and more memory efficient.
+    Arguments:
+    - p: float np.ndarray of shape (dims, Ly, Lx) or (dims, Lz, Ly, Lx)
+    - iscell: bool np.ndarray of shape (Ly, Lx) or (Lz, Ly, Lx)
+    Returns:
+    - np.ndarray of the same shape and dtype as p
+    """
+    shape0 = p.shape[1:]
+    dims = len(p)
+    if iscell is not None:
+        inds = np.indices(shape0, dtype=np.int32)
+        for i in range(dims):
+            p[i][~iscell] = inds[i][~iscell]
+    return p
+
+
+def find_seeds(h: np.ndarray, hmax: np.ndarray) -> tuple:
+    """
+    Calculate seeds based on h and hmax.
+    Arguments:
+    - h: multidimensional np.ndarray
+    - hmax: multidimensional np.ndarray of same shape as h; result of applying maximum_filter to h
+    Returns:
+    - tuple of two np.ndarrays representing coordinate indices of seeds
+    """
+    mask = (h - hmax > -1e-6) & (h > 10)
+
+    flat_indices = np.flatnonzero(mask)
+
+    if flat_indices.size == 0:
+        return tuple(np.array([], dtype=int) for _ in range(h.ndim))
+
+    Nmax = h.flat[flat_indices]
+    sorted_order = np.argsort(Nmax)[::-1]
+    sorted_flat_indices = flat_indices[sorted_order]
+    sorted_indices = np.unravel_index(sorted_flat_indices, h.shape)
+
+    return sorted_indices
+
+
+def iterative_expansion(seeds: tuple[np.ndarray], h: np.ndarray, niters: int) -> list[tuple[np.ndarray]]:
+    """
+    Iteratively expand seeds into their immediate neighborhoods based on h.
+    For each iteration, expand each seed into its 3x3 neighborhood; mask out-of-bounds locations; and
+    keep only locations that meet the expansion threshold (based on h).
+    Label each expanded location with the seed it originated from at the start, and duplicate the labels as
+    needed through expansion so the final coordinates can be collated by initial seed.
+    Arguments:
+    - seeds: tuple of two np.ndarrays representing coordinate indices of seeds
+    - h: multidimensional np.ndarray from N-dim histogram
+    - niters: number of iterations to expand seeds
+    Returns:
+    - list where each element is a tuple of np.ndarrays, each representing indices expanded from a common seed
+    """
+
+    seeds_np = np.array(seeds).T  # shape is [N, 2]
+    igood_all = h > 2 # pre-calculate threshold for expansion
+
+    bounds = np.array(h.shape)  # shape is [2,]
+    nseeds = seeds_np.shape[0]
+    labels_flat = np.arange(nseeds)  # keep track of which feature each expanded location originated from
+
+    shifts = np.nonzero(np.ones((3, 3)))
+    shifts = np.stack(shifts) - 1  # shape is [2, 9]; x-shifts and y-shifts in [-1, 0, +1]
+
+    for _ in range(niters):
+        # For each seed, also get the coordinates of the 3x3 neighborhood
+        shifted_seeds = seeds_np[:, :, None] + shifts[None, :, :]  # shape is [N, 2, 9]
+
+        # Check that the expanded coordinates are in the array bounds
+        # Using a masked array here would be cleaner, but the overhead is surprisingly measurable
+        out_of_bounds = np.any((shifted_seeds < 0) | (shifted_seeds >= bounds[:, None]), axis=1)  # shape is [N, 9]
+        mask = out_of_bounds.flatten()  # shape is [N*9,]
+
+        # Reshape the neighborhoods into the feature axis, [N, 2, 9] -> [N*9, 2], keeping the labels with the coordinates
+        nseeds = seeds_np.shape[0]
+        shifted_seeds_flat = np.transpose(shifted_seeds, (0, 2, 1)).reshape(nseeds * 9, 2)  # shape is [N*9, 2]
+        labels_flat = np.broadcast_to(labels_flat[:, None], (nseeds, 9)).reshape(-1)  # shape is [9*N,]
+
+        # Check which of the shifted locations meet the expansion threshold
+        igood = igood_all[shifted_seeds_flat[:, 0], shifted_seeds_flat[:, 1]]
+        mask[~igood] = True
+
+        # Update with masks for the next iteration
+        seeds_np = shifted_seeds_flat[~mask, :]
+        labels_flat = labels_flat[~mask]
+
+    # Use the labels to collate back into a list where each element is a list of coordinates sharing an initial seed
+    isort = np.argsort(labels_flat)
+    labels_sorted = labels_flat[isort]
+    seeds_sorted = seeds_np[isort, :]
+    _, start_indices, label_counts = np.unique(labels_sorted, return_index=True, return_counts=True)
+    pix_out = [(seeds_sorted[start:start + count, 0], seeds_sorted[start:start + count, 1]) for start, count in
+               zip(start_indices, label_counts)]
+
+    return pix_out
+
+
 def get_masks(p, iscell=None, rpad=20, logger=None):
     """Create masks using pixel convergence after running dynamics.
 
@@ -691,19 +789,10 @@ def get_masks(p, iscell=None, rpad=20, logger=None):
     edges = []
     shape0 = p.shape[1:]
     dims = len(p)
+
     if logger is not None: logger.info(f'get_masks: meshgrid')
-
     t1 = time.monotonic()
-    if iscell is not None:
-        if dims == 3:
-            inds = np.meshgrid(np.arange(shape0[0]), np.arange(shape0[1]),
-                               np.arange(shape0[2]), indexing="ij")
-        elif dims == 2:
-            inds = np.meshgrid(np.arange(shape0[0]), np.arange(shape0[1]),
-                               indexing="ij")
-        for i in range(dims):
-            p[i, ~iscell] = inds[i][~iscell]
-
+    p = construct_meshgrid(p, iscell)
     t2 = time.monotonic()
     dt = t2 - t1
     if logger is not None: logger.info(f'get_masks: meshgrid : {timedelta(seconds=dt)}')
@@ -719,7 +808,6 @@ def get_masks(p, iscell=None, rpad=20, logger=None):
     dt = t2 - t1
     if logger is not None: logger.info(f'get_masks: histogram1d : {timedelta(seconds=dt)}')
 
-
     hmax = h.copy()
     for i in range(dims):
         if logger is not None: logger.info(f'get_masks: maximum_filter1d')
@@ -729,44 +817,11 @@ def get_masks(p, iscell=None, rpad=20, logger=None):
         dt = t2 - t1
         if logger is not None: logger.info(f'get_masks: maximum_filter1d : {timedelta(seconds=dt)}')
 
-    seeds = np.nonzero(np.logical_and(h - hmax > -1e-6, h > 10))
-    Nmax = h[seeds]
-    isort = np.argsort(Nmax)[::-1]
-    for s in seeds:
-        s[:] = s[isort]
-
-    pix = list(np.array(seeds).T)
-
-    shape = h.shape
-    if dims == 3:
-        expand = np.nonzero(np.ones((3, 3, 3)))
-    else:
-        expand = np.nonzero(np.ones((3, 3)))
-
     if logger is not None: logger.info(f'get_masks: big loop: pix: {len(pix)}')
     if logger is not None: logger.info(f'get_masks: big loop')
     t1 = time.monotonic()
-    for iter in range(5):
-        for k in range(len(pix)):
-            if iter == 0:
-                pix[k] = list(pix[k])
-            newpix = []
-            iin = []
-            for i, e in enumerate(expand):
-                epix = e[:, np.newaxis] + np.expand_dims(pix[k][i], 0) - 1
-                epix = epix.flatten()
-                iin.append(np.logical_and(epix >= 0, epix < shape[i]))
-                newpix.append(epix)
-            iin = np.all(tuple(iin), axis=0)
-            for p in newpix:
-                p = p[iin]
-            newpix = tuple(newpix)
-            igood = h[newpix] > 2
-            for i in range(dims):
-                pix[k][i] = newpix[i][igood]
-            if iter == 4:
-                pix[k] = tuple(pix[k])
-
+    seeds = find_seeds(h, hmax)
+    pix = iterative_expansion(seeds, h, niters=5)
     t2 = time.monotonic()
     dt = t2 - t1
     if logger is not None: logger.info(f'get_masks: big loop : {timedelta(seconds=dt)}')
