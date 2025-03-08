@@ -15,6 +15,8 @@ import fastremap
 import logging
 from datetime import timedelta
 
+from .dynamics_parallelized import masks_to_flows_cpu_parallel
+
 dynamics_logger = logging.getLogger(__name__)
 
 from . import utils, metrics, transforms
@@ -337,9 +339,9 @@ def masks_to_flows(masks, device=None, niter=None):
         if device.type == "cuda" or device.type == "mps":
             masks_to_flows_device = masks_to_flows_gpu
         else:
-            masks_to_flows_device = masks_to_flows_cpu
+            masks_to_flows_device = masks_to_flows_cpu_parallel
     else:
-        masks_to_flows_device = masks_to_flows_cpu
+        masks_to_flows_device = masks_to_flows_cpu_parallel
 
     if masks.ndim == 3:
         Lz, Ly, Lx = masks.shape
