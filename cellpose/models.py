@@ -305,6 +305,8 @@ class CellposeModel():
         if not self.gpu:
             self.mkldnn = check_mkl(True)
 
+        if isinstance(device_for_masks, str):
+            device_for_masks = torch.device(device_for_masks)
         self.device_for_masks = device_for_masks
 
         ### create neural network
