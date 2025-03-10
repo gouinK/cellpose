@@ -106,13 +106,14 @@ class Cellpose():
 
     """
 
-    def __init__(self, gpu=False, model_type="cyto3", nchan=2, device=None,
+    def __init__(self, gpu=False, model_type="cyto3", nchan=2, device=None, device_for_masks=torch.device("cpu"),
                  backbone="default"):
         super(Cellpose, self).__init__()
 
         # assign device (GPU or CPU)
         sdevice, gpu = assign_device(use_torch=True, gpu=gpu)
         self.device = device if device is not None else sdevice
+        self.device_for_masks = device_for_masks
         self.gpu = gpu
         self.backbone = backbone
 
@@ -129,8 +130,8 @@ class Cellpose():
                 f"cannot set nchan to other value for {model_type} model")
         self.nchan = nchan
 
-        self.cp = CellposeModel(device=self.device, gpu=self.gpu, model_type=model_type,
-                                diam_mean=self.diam_mean, nchan=self.nchan,
+        self.cp = CellposeModel(device=self.device, device_for_masks=device_for_masks, gpu=self.gpu,
+                                model_type=model_type, diam_mean=self.diam_mean, nchan=self.nchan,
                                 backbone=self.backbone)
         self.cp.model_type = model_type
 
@@ -237,7 +238,7 @@ class CellposeModel():
     """
 
     def __init__(self, gpu=False, pretrained_model=False, model_type=None,
-                 diam_mean=30., device=None, nchan=2, backbone="default"):
+                 diam_mean=30., device=None, device_for_masks=torch.device("cpu"), nchan=2, backbone="default"):
         """
         Initialize the CellposeModel.
 
@@ -247,6 +248,7 @@ class CellposeModel():
             model_type (str, optional): Any model that is available in the GUI, use name in GUI e.g. "livecell" (can be user-trained or model zoo).
             diam_mean (float, optional): Mean "diameter", 30. is built-in value for "cyto" model; 17. is built-in value for "nuclei" model; if saved in custom model file (cellpose>=2.0) then it will be loaded automatically and overwrite this value.
             device (torch device, optional): Device used for model running / training (torch.device("cuda") or torch.device("cpu")), overrides gpu input, recommended if you want to use a specific GPU (e.g. torch.device("cuda:1")).
+            device_for_masks (torch device, optional): Device used for compute_masks. Defaults to torch.device("cpu"), since the arrays are typically too big for a GPU.
             nchan (int, optional): Number of channels to use as input to network, default is 2 (cyto + nuclei) or (nuclei + zeros).
         """
         self.diam_mean = diam_mean
@@ -302,6 +304,8 @@ class CellposeModel():
         self.gpu = gpu if device is None else device_gpu
         if not self.gpu:
             self.mkldnn = check_mkl(True)
+
+        self.device_for_masks = device_for_masks
 
         ### create neural network
         self.nchan = nchan
@@ -585,7 +589,7 @@ class CellposeModel():
                     dP, cellprob, niter=niter, cellprob_threshold=cellprob_threshold,
                     flow_threshold=flow_threshold, interp=interp, do_3D=do_3D,
                     min_size=min_size, resize=None,
-                    device=self.device if self.gpu else None)
+                    device=self.device_for_masks)
             else:
                 masks, p = [], []
                 resize = [shape[1], shape[2]] if (not resample and
@@ -604,7 +608,7 @@ class CellposeModel():
                         resize=resize,
                         min_size=min_size if stitch_threshold == 0 or nimg == 1 else
                         -1,  # turn off for 3D stitching
-                        device=self.device if self.gpu else None,
+                        device=self.device_for_masks,
                         logger=logger)
                     masks.append(outputs[0])
                     p.append(outputs[1])

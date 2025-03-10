@@ -318,7 +318,7 @@ def masks_to_flows_cpu(masks, device=None, niter=None):
     return mu, meds
 
 
-def masks_to_flows(masks, device=None, niter=None):
+def masks_to_flows(masks, device=None, niter=None, multithread=True):
     """Convert masks to flows using diffusion from center pixel.
 
     Center of masks where diffusion starts is defined to be the closest pixel to the mean of all pixels that is inside the mask.
@@ -326,6 +326,9 @@ def masks_to_flows(masks, device=None, niter=None):
 
     Args:
         masks (int, 2D or 3D array): Labelled masks 0=NO masks; 1,2,...=mask labels
+        device (torch.device, optional): Device to use for computation
+        niter (int, optional): Number of iterations for computing flows
+        multithread (bool, optional): Single-threaded vs. parallel computation with numba
 
     Returns:
         mu (float, 3D or 4D array): Flows in Y = mu[-2], flows in X = mu[-1].
@@ -335,13 +338,12 @@ def masks_to_flows(masks, device=None, niter=None):
         dynamics_logger.warning("empty masks!")
         return np.zeros((2, *masks.shape), "float32")
 
-    if device is not None:
-        if device.type == "cuda" or device.type == "mps":
-            masks_to_flows_device = masks_to_flows_gpu
-        else:
-            masks_to_flows_device = masks_to_flows_cpu_parallel
-    else:
+    if device is not None and (device.type == "cuda" or device.type == "mps"):
+        masks_to_flows_device = masks_to_flows_gpu
+    elif multithread:
         masks_to_flows_device = masks_to_flows_cpu_parallel
+    else:
+        masks_to_flows_device = masks_to_flows_cpu
 
     if masks.ndim == 3:
         Lz, Ly, Lx = masks.shape
@@ -642,7 +644,7 @@ def remove_bad_flow_masks(masks, flows, threshold=0.4, device=None, multithread=
 
     if logger is not None: logger.info(f'remove_bad_flow_masks: {device0=}')
     t1 = time.monotonic()
-    merrors, _ = metrics.flow_error(masks, flows, device0, logger=logger)
+    merrors, _ = metrics.flow_error(masks, flows, device0, multithread=multithread, logger=logger)
     badi = 1 + (merrors > threshold).nonzero()[0]
     masks[np.isin(masks, badi)] = 0
 
@@ -805,7 +807,6 @@ def get_masks(p, iscell=None, rpad=20, logger=None):
         dt = t2 - t1
         if logger is not None: logger.info(f'get_masks: maximum_filter1d : {timedelta(seconds=dt)}')
 
-    if logger is not None: logger.info(f'get_masks: big loop: pix: {len(pix)}')
     if logger is not None: logger.info(f'get_masks: big loop')
     t1 = time.monotonic()
     seeds = find_seeds(h, hmax)
@@ -934,12 +935,12 @@ def compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
                     if logger is not None: logger.info("Attempting remove_bad_flow_masks with default device.")
                     # print("Attempting remove_bad_flow_masks with default device.")
                     mask = remove_bad_flow_masks(mask, dP, threshold=flow_threshold,
-                                                device=device, logger=logger)
+                                                device=device, multithread=True, logger=logger)
                 except:
-                    if logger is not None: logger.info("Resorting to CPU for remove_bad_flow_masks.")
+                    if logger is not None: logger.info("Resorting to single CPU for remove_bad_flow_masks.")
                     # print("Resorting to CPU for remove_bad_flow_masks.")
                     mask = remove_bad_flow_masks(mask, dP, threshold=flow_threshold,
-                                                device= None, logger=logger)
+                                                device=None, multithread=False, logger=logger)
         if mask.max() > 2**16 - 1:
             recast = True
             mask = mask.astype(np.float32)

@@ -232,7 +232,7 @@ def _true_positive(iou, th):
     return tp
 
 
-def flow_error(maski, dP_net, device=None, logger=None):
+def flow_error(maski, dP_net, device=None, multithread=True, logger=None):
     """Error in flows from predicted masks vs flows predicted by network run on image.
 
     This function serves to benchmark the quality of masks. It works as follows:
@@ -246,6 +246,8 @@ def flow_error(maski, dP_net, device=None, logger=None):
     Args:
         maski (np.ndarray, int): Masks produced from running dynamics on dP_net, where 0=NO masks; 1,2... are mask labels.
         dP_net (np.ndarray, float): ND flows where dP_net.shape[1:] = maski.shape.
+        device (torch.device, optional): Device to run masks_to_flows on. Defaults to None, for CPU.
+        multithread (bool, optional): Whether to run masks_to_flows using parallelized numba.
 
     Returns:
         flow_errors (np.ndarray, float): Mean squared error between predicted flows and flows from masks.
@@ -259,7 +261,7 @@ def flow_error(maski, dP_net, device=None, logger=None):
 
     if logger is not None: logger.info(f'flow_error: dynamics.masks_to_flows')
     t1 = time.monotonic()
-    dP_masks = dynamics.masks_to_flows(maski, device=device)
+    dP_masks = dynamics.masks_to_flows(maski, device=device, multithread=multithread)
     t2 = time.monotonic()
     dt = t2 - t1
     if logger is not None: logger.info(f'flow_error: dynamics.masks_to_flows: {timedelta(seconds=dt)}')
