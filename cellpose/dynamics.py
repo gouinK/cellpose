@@ -415,42 +415,48 @@ def labels_to_flows(labels, files=None, device=None, redo_flows=False, niter=Non
     return flows
 
 
-@njit([
-    "(int16[:,:,:], float32[:], float32[:], float32[:,:])",
-    "(float32[:,:,:], float32[:], float32[:], float32[:,:])"
-], cache=True)
+@njit(["(int16[:,:,:], float32[:], float32[:], float32[:,:])",
+       "(float32[:,:,:], float32[:], float32[:], float32[:,:])"],
+      parallel=True,
+      fastmath=True)
 def map_coordinates(I, yc, xc, Y):
     """
     Bilinear interpolation of image "I" in-place with y-coordinates yc and x-coordinates xc to Y.
-    
+
     Args:
         I (numpy.ndarray): Input image of shape (C, Ly, Lx).
         yc (numpy.ndarray): New y-coordinates.
         xc (numpy.ndarray): New x-coordinates.
         Y (numpy.ndarray): Output array of shape (C, ni).
-    
-    Returns:
-        None
     """
     C, Ly, Lx = I.shape
-    yc_floor = yc.astype(np.int32)
-    xc_floor = xc.astype(np.int32)
-    yc = yc - yc_floor
-    xc = xc - xc_floor
-    for i in range(yc_floor.shape[0]):
-        yf = min(Ly - 1, max(0, yc_floor[i]))
-        xf = min(Lx - 1, max(0, xc_floor[i]))
-        yf1 = min(Ly - 1, yf + 1)
-        xf1 = min(Lx - 1, xf + 1)
-        y = yc[i]
-        x = xc[i]
+    n_points = yc.shape[0]
+    for i in prange(n_points):
+        yf = int(yc[i])
+        xf = int(xc[i])
+
+        if yf < 0:
+            yf = 0
+        elif yf >= Ly:
+            yf = Ly - 1
+        if xf < 0:
+            xf = 0
+        elif xf >= Lx:
+            xf = Lx - 1
+
+        y_ratio = yc[i] - yf
+        x_ratio = xc[i] - xf
+        yf1 = yf + 1 if yf < Ly - 1 else yf
+        xf1 = xf + 1 if xf < Lx - 1 else xf
+
         for c in range(C):
-            Y[c, i] = (np.float32(I[c, yf, xf]) * (1 - y) * (1 - x) +
-                       np.float32(I[c, yf, xf1]) * (1 - y) * x +
-                       np.float32(I[c, yf1, xf]) * y * (1 - x) +
-                       np.float32(I[c, yf1, xf1]) * y * x)
+            Y[c, i] = (I[c, yf, xf] * (1 - y_ratio) * (1 - x_ratio) +
+                       I[c, yf, xf1] * (1 - y_ratio) * x_ratio +
+                       I[c, yf1, xf] * y_ratio * (1 - x_ratio) +
+                       I[c, yf1, xf1] * y_ratio * x_ratio)
 
 
+@njit(fastmath=True)
 def steps2D_interp(p, dP, niter, device=None):
     """ Run dynamics of pixels to recover masks in 2D, with interpolation between pixel values.
 
@@ -469,47 +475,21 @@ def steps2D_interp(p, dP, niter, device=None):
         None
 
     """
+    n_axes, n_points = p.shape
+    dPt = np.zeros_like(p)
 
-    shape = dP.shape[1:]
-    if device is not None and device.type == "cuda":
-        shape = np.array(shape)[[
-            1, 0
-        ]].astype("float") - 1  # Y and X dimensions (dP is 2.Ly.Lx), flipped X-1, Y-1
-        pt = torch.from_numpy(p[[1, 0]].T).float().to(device).unsqueeze(0).unsqueeze(
-            0)  # p is n_points by 2, so pt is [1 1 2 n_points]
-        im = torch.from_numpy(dP[[1, 0]]).float().to(device).unsqueeze(
-            0)  #covert flow numpy array to tensor on GPU, add dimension
-        # normalize pt between  0 and  1, normalize the flow
-        for k in range(2):
-            im[:, k, :, :] *= 2. / shape[k]
-            pt[:, :, :, k] /= shape[k]
-
-        # normalize to between -1 and 1
-        pt = pt * 2 - 1
-
-        #here is where the stepping happens
-        for t in range(niter):
-            # align_corners default is False, just added to suppress warning
-            dPt = torch.nn.functional.grid_sample(im, pt, align_corners=False)
-            for k in range(2):  #clamp the final pixel locations
-                pt[:, :, :, k] = torch.clamp(pt[:, :, :, k] + dPt[:, k, :, :], -1., 1.)
-
-        #undo the normalization from before, reverse order of operations
-        pt = (pt + 1) * 0.5
-        for k in range(2):
-            pt[:, :, :, k] *= shape[k]
-
-        p = pt[:, :, :, [1, 0]].cpu().numpy().squeeze().T
-        return p
-
-    else:
-        dPt = np.zeros(p.shape, np.float32)
-
-        for t in range(niter):
-            map_coordinates(dP.astype(np.float32), p[0], p[1], dPt)
-            for k in range(len(p)):
-                p[k] = np.minimum(shape[k] - 1, np.maximum(0, p[k] + dPt[k]))
-        return p
+    for t in range(niter):
+        map_coordinates(dP, p[0], p[1], dPt)
+        for i in range(n_axes):
+            max_val = dP.shape[i + 1] - 1
+            for j in range(n_points):
+                new_val = p[i, j] + dPt[i, j]
+                if new_val < 0.0:
+                    new_val = 0.0
+                elif new_val > max_val:
+                    new_val = max_val
+                p[i, j] = new_val
+    return p
 
 
 @njit("(float32[:,:,:,:],float32[:,:,:,:], int32[:,:], int32)", nogil=True)
@@ -588,11 +568,16 @@ def follow_flows(dP, mask=None, niter=200, interp=True, device=None):
             - inds (np.ndarray): Indices of pixels used for dynamics; [axis x Ly x Lx] or [axis x Lz x Ly x Lx].
     """
 
-    shape = np.array(dP.shape[1:]).astype(np.int32)
+    if dP.dtype != np.float32:
+        dP = dP.astype(np.float32)
+
+    shape = np.array(dP.shape[1:], dtype=np.int32)
     niter = np.uint32(niter)
 
     p = np.indices(shape, dtype=np.float32)  # bit faster than going through meshgrid, but mostly less memory-intensive
     inds = np.array(np.nonzero(np.abs(dP).max(axis=0) > 1e-3)).astype(np.int32).T
+    if inds.shape[0] == 0:
+        return p, inds
 
     if len(shape) > 2:
         # run dynamics on subset of pixels
@@ -605,14 +590,15 @@ def follow_flows(dP, mask=None, niter=200, interp=True, device=None):
         if not interp:
             p = steps2D(p, dP.astype(np.float32), inds, niter)
         else:
-            p_interp = steps2D_interp(p[:, inds[:, 0], inds[:, 1]], dP, niter, device=device)
-            for i in range(len(p)):  # somewhat faster than fancy indexing across the 0th axis
+            p_points = p[:, inds[:, 0], inds[:, 1]].copy()
+            p_interp = steps2D_interp(p_points, dP, np.int32(niter))
+            for i in range(p.shape[0]):
                 p[i, inds[:, 0], inds[:, 1]] = p_interp[i]
 
     return p, inds
 
 
-def remove_bad_flow_masks(masks, flows, threshold=0.4, device=None, logger=None):
+def remove_bad_flow_masks(masks, flows, threshold=0.4, device=None, multithread=True, logger=None):
     """Remove masks which have inconsistent flows.
 
     Uses metrics.flow_error to compute flows from predicted masks 
